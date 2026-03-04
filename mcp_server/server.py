@@ -45,7 +45,25 @@ async def get_meeting_summary(meeting_id: str) -> str:
             row = await cursor.fetchone()
 
     if not row or not row[0]:
-        return f"No summary available for meeting '{meeting[0]}' (status: {row[1] if row else 'not processed'})."
+        # Fallback: return raw transcript so Claude can summarize directly
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT transcript FROM transcripts WHERE meeting_id = ? ORDER BY timestamp",
+                (meeting_id,),
+            ) as cursor:
+                t_rows = await cursor.fetchall()
+
+        if not t_rows:
+            return f"No summary or transcript found for meeting '{meeting[0]}'."
+
+        full_text = " ".join(r[0] for r in t_rows if r[0] and r[0].strip())
+        text = full_text[:30000]
+        truncated = " (truncated)" if len(full_text) > 30000 else ""
+        return (
+            f"# {meeting[0]}\nDate: {meeting[1]}\n"
+            f"(No pre-generated summary available{truncated} — raw transcript below. Please summarize.)\n\n"
+            + text
+        )
 
     try:
         result = json.loads(row[0])
@@ -223,6 +241,49 @@ async def get_action_items(person: str = "") -> str:
         return msg
 
     return json.dumps(items, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_meeting_transcript(meeting_id: str, max_chars: int = 30000) -> str:
+    """
+    Get the raw transcript text for a meeting by its ID.
+    Use this when no summary is available (e.g. summary generation failed).
+    Claude can then summarize the transcript directly.
+    max_chars limits the returned text to avoid context overflow (default 30000).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT title, created_at FROM meetings WHERE id = ?", (meeting_id,)
+        ) as cursor:
+            meeting = await cursor.fetchone()
+
+        if not meeting:
+            return f"Meeting {meeting_id} not found."
+
+        async with db.execute(
+            """
+            SELECT transcript FROM transcripts
+            WHERE meeting_id = ?
+            ORDER BY timestamp
+            """,
+            (meeting_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        return f"No transcript found for meeting '{meeting[0]}'."
+
+    full_text = " ".join(r[0] for r in rows if r[0] and r[0].strip())
+
+    truncated = len(full_text) > max_chars
+    text = full_text[:max_chars]
+
+    header = f"# Transcript: {meeting[0]}\nDate: {meeting[1]}\n"
+    if truncated:
+        header += f"(Showing first {max_chars} of {len(full_text)} characters)\n"
+    header += "\n"
+
+    return header + text
 
 
 if __name__ == "__main__":
